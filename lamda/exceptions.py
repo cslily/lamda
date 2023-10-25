@@ -4,6 +4,8 @@
 # See file LICENSE for detail or copy at https://opensource.org/licenses/MIT
 class CompatibilityException(Exception):
     """ Exception """
+class DeadSystemException(Exception):
+    """ Exception """
 class DeviceUnavailable(Exception):
     """ Exception """
 class IllegalArgumentException(Exception):
@@ -30,7 +32,11 @@ class SecurityException(Exception):
     """ Exception """
 class ServiceUnavailable(Exception):
     """ Exception """
+class StaleObjectException(Exception):
+    """ Exception """
 class StartupActivityNotFound(Exception):
+    """ Exception """
+class StorageOutOfMemory(Exception):
     """ Exception """
 class UiAutomatorException(Exception):
     """ Exception """

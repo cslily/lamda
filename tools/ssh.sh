@@ -39,4 +39,4 @@ else
 DEFAULT_ID_RSA=$CERTIFICATE
 fi
 exec ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
-         -o LogLevel=ERROR -i $DEFAULT_ID_RSA -p $PORT root@$TARGET
+         -o LogLevel=ERROR -i $DEFAULT_ID_RSA -p $PORT root@$TARGET ${@:2}
