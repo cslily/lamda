@@ -18,6 +18,7 @@ import public "settings.proto";
 import public "status.proto";
 import public "application.proto";
 import public "uiautomator.proto";
+import public "storage.proto";
 import public "proxy.proto";
 import public "file.proto";
 import public "wifi.proto";
@@ -32,6 +33,7 @@ service Application {
     rpc getPermissions(ApplicationRequest) returns (ApplicationPermissions) {}
     rpc resetApplicationData(ApplicationRequest) returns (Boolean) {}
     rpc deleteApplicationCache(ApplicationRequest) returns (Boolean) {}
+    rpc getLastActivities(Integer) returns (ApplicationActivityInfoList) {}
     rpc startActivity(ApplicationActivityRequest) returns (Boolean) {}
     rpc applicationInfo(ApplicationRequest) returns (ApplicationInfo) {}
     rpc startApplication(ApplicationRequest) returns (Boolean) {}
@@ -54,9 +56,12 @@ service Debug {
     rpc isIDA64Running(google.protobuf.Empty) returns (Boolean) {}
     rpc isAndroidDebugBridgeRunning(google.protobuf.Empty) returns (Boolean) {}
 
+    rpc installADBPubKey(ADBDConfigRequest) returns (Boolean) {}
+    rpc uninstallADBPubKey(ADBDConfigRequest) returns (Boolean) {}
+
     rpc startIDA(IDAConfigRequest) returns (Boolean) {}
     rpc startIDA64(IDAConfigRequest) returns (Boolean) {}
-    rpc startAndroidDebugBridge(ADBDConfigRequest) returns (Boolean) {}
+    rpc startAndroidDebugBridge(google.protobuf.Empty) returns (Boolean) {}
 
     rpc stopIDA(google.protobuf.Empty) returns (Boolean) {}
     rpc stopIDA64(google.protobuf.Empty) returns (Boolean) {}
@@ -144,6 +149,7 @@ service UiAutomator {
     rpc selectorLongClick(SelectorClickRequest) returns (Boolean) {}
 
     rpc selectorExists(SelectorOnlyRequest) returns (Boolean) {}
+    rpc getLastToast(google.protobuf.Empty) returns (ToastInfo) {}
 
     rpc selectorObjInfo(SelectorOnlyRequest) returns (ObjInfo) {}
     rpc selectorObjInfoOfAllInstances(SelectorOnlyRequest) returns (ObjInfoList) {}
@@ -164,6 +170,9 @@ service UiAutomator {
     rpc selectorScrollToEnd(SelectorScrollRequest) returns (Boolean) {}
     rpc selectorScrollBackward(SelectorScrollRequest) returns (Boolean) {}
     rpc selectorScrollForward(SelectorScrollRequest) returns (Boolean) {}
+
+    rpc selectorPinchOut(SelectorPinchRequest) returns (Boolean) {}
+    rpc selectorPinchIn(SelectorPinchRequest) returns (Boolean) {}
 
     rpc setWatcherLoopEnabled(Boolean) returns (Boolean) {}
     rpc getWatcherLoopEnabled(google.protobuf.Empty) returns (Boolean) {}
@@ -212,7 +221,7 @@ service Util {
     rpc installCACertificate(CertifiRequest) returns (Boolean) {}
     rpc uninstallCACertificate(CertifiRequest) returns (Boolean) {}
     rpc shutdown(google.protobuf.Empty) returns (Boolean) {}
-    rpc reload(google.protobuf.Empty) returns (Boolean) {}
+    rpc reload(Boolean) returns (Boolean) {}
     rpc exit(google.protobuf.Empty) returns (Boolean) {}
     rpc setProp(SetPropRequest) returns (Boolean) {}
     rpc getProp(String) returns (String) {}
@@ -228,6 +237,21 @@ service File {
 
 service Lock {
     rpc releaseLock(google.protobuf.Empty) returns (Boolean) {}
+    rpc getLockingSession(google.protobuf.Empty) returns (String) {}
+    rpc getSessionToken(google.protobuf.Empty) returns (String) {}
     rpc acquireLock(Integer) returns (Boolean) {}
     rpc refreshLock(Integer) returns (Boolean) {}
+}
+
+service Storage {
+    rpc clearAll(StorageRequest) returns (Boolean) {}
+    rpc clearContainer(StorageRequest) returns (Boolean) {}
+    rpc exists(StorageRequest) returns (Boolean) {}
+    rpc delete(StorageRequest) returns (Boolean) {}
+    rpc expire(StorageRequest) returns (Boolean) {}
+    rpc ttl(StorageRequest) returns (Integer) {}
+    rpc set(StorageRequest) returns (Boolean) {}
+    rpc setnx(StorageRequest) returns (Boolean) {}
+    rpc setex(StorageRequest) returns (Boolean) {}
+    rpc get(StorageRequest) returns (Bytes) {}
 }

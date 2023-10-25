@@ -1,8 +1,9 @@
 #!/bin/bash
+[ $# -lt 2 ] && exit 1
 DEFAULT_ID_RSA=$(mktemp)
 PORT=${PORT:-65000}
 case "$1" in
-                *':/'*)
+                *':'*)
                                 p1=root@$1
                                 p2=$2
                 ;;

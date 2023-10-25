@@ -2,33 +2,29 @@ FROM debian:bullseye-slim
 
 LABEL maintainer="rev1si0n <ihaven0emmail@gmail.com>"
 
+ENV VERSION=2.11.4
+ENV PLAT=linux-386
+
 ENV PYPIMIRROR=https://mirrors.ustc.edu.cn/pypi/web/simple
-ENV SSCLIENT=https://github.com/shadowsocks/go-shadowsocks2/releases/download/v0.1.5/shadowsocks2-linux.gz
-ENV SOURCESMIRROR=mirrors.ustc.edu.cn
-
-RUN sed -i "s/deb.debian.org/${SOURCESMIRROR}/g" /etc/apt/sources.list
-RUN sed -i "s|security.debian.org/debian-security|${SOURCESMIRROR}/debian-security|g" /etc/apt/sources.list
-
-RUN apt-get update && apt-get -y upgrade
-RUN apt install -y git adb wget privoxy python3 python3-pip
-
-COPY entry /usr/bin/mitm
-RUN chmod 755 /usr/bin/mitm
+ENV GOST=https://github.com/ginuerzh/gost/releases/download/v${VERSION}/gost-${PLAT}-${VERSION}.gz
+ENV BINDIR=/usr/local/bin
 
 WORKDIR /tmp
+RUN apt-get update && apt-get -y upgrade && apt install -y adb gcc wget dnsutils python3 python3-pip
 
-RUN git clone https://github.com/rev1si0n/lamda
-RUN pip3 install -i ${PYPIMIRROR} -r lamda/tools/requirements.txt
-RUN pip3 install -i ${PYPIMIRROR} packaging
+RUN wget ${GOST} -O - | gzip -d> ${BINDIR}/gost
 
-RUN cp lamda/tools/startmitm.py /usr/bin
-RUN chmod 755 /usr/bin/startmitm.py
+COPY startmitm.py ${BINDIR}
+COPY globalmitm/entry ${BINDIR}
+COPY globalmitm/DNS2SOCKS.c /tmp
+COPY requirements.txt /tmp
 
-RUN wget ${SSCLIENT} -O - | gzip -d> /usr/bin/go-shadowsocks2
-RUN chmod 755 /usr/bin/go-shadowsocks2
+RUN gcc -pthread DNS2SOCKS.c -o ${BINDIR}/DNS2SOCKS
+RUN pip3 install -i ${PYPIMIRROR} --no-cache-dir -r requirements.txt
 
-RUN ( timeout 5 mitmdump; exit 0 ) && rm -rf lamda
+RUN chmod 755 ${BINDIR}/*
+ENV PATH=${BINDIR}:${PATH}
+
 WORKDIR /root
-
-EXPOSE 53/tcp 53/udp 8118/tcp
-ENTRYPOINT [ "mitm" ]
+EXPOSE 53/udp 8118/tcp 1234/tcp
+ENTRYPOINT [ "entry" ]

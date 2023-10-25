@@ -3,23 +3,36 @@
 # Distributed under MIT license.
 # See file LICENSE for detail or copy at https://opensource.org/licenses/MIT
 import os
+import io
 import re
 import sys
+import copy
 import time
 import uuid
 import json
+import base64
+import hashlib
 import platform
 import warnings
 import builtins
-import pathlib
 import logging
-import atexit
+import msgpack
+# fix protobuf>=4.0/win32, #10158
+if sys.platform == "win32":
+    os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 import grpc
 
+import pem as Pem
+import collections.abc
+# fix pyreadline, py310, Windows
+collections.Callable = collections.abc.Callable
+
+from urllib.parse import quote
 from collections import defaultdict
+from cryptography.fernet import Fernet
 from os.path import basename, dirname, expanduser, join as joinpath
+from google.protobuf.json_format import MessageToDict, MessageToJson
 from grpc_interceptor import ClientInterceptor
-from google.protobuf.json_format import MessageToDict
 from google.protobuf.message import Message
 from asn1crypto import pem, x509
 
@@ -34,9 +47,8 @@ from . types import AttributeDict, BytesIO
 from . exceptions import UnHandledException
 from . import exceptions
 
-logger = logging.getLogger(__file__)
+logger = logging.getLogger("lamda")
 FORMAT = "%(asctime)s %(process)d %(levelname)7s@%(module)s:%(funcName)s - %(message)s"
-logging.basicConfig(format=FORMAT)
 
 sys.path.append(joinpath(dirname(__file__)))
 sys.path.append(joinpath(dirname(__file__), "rpc"))
@@ -52,6 +64,11 @@ __all__ = [
                 "Keys",
                 "KeyCode",
                 "KeyCodes",
+                "BaseCryptor",
+                "FernetCryptor",
+                "OpenVPNAuth",
+                "OpenVPNEncryption",
+                "OpenVPNKeyDirection",
                 "OpenVPNCipher",
                 "OpenVPNProto",
                 "Orientation",
@@ -67,7 +84,9 @@ __all__ = [
                 "Point",
                 "Bound",
                 "load_proto",
+                "to_dict",
                 "Device",
+                "logger",
 ]
 
 def getXY(p):
@@ -151,6 +170,9 @@ Keys = protos.Key # make an alias
 KeyCode = protos.KeyCode
 KeyCodes = protos.KeyCode # make an alias
 
+OpenVPNAuth = protos.OpenVPNAuth
+OpenVPNEncryption = protos.OpenVPNEncryption
+OpenVPNKeyDirection = protos.OpenVPNKeyDirection
 OpenVPNCipher = protos.OpenVPNCipher
 OpenVPNProto = protos.OpenVPNProto
 Orientation = protos.Orientation
@@ -170,7 +192,7 @@ TouchAction = protos.TouchAction
 
 ApplicationInfo = protos.ApplicationInfo
 # uiautomator types
-Selector = protos.Selector
+_Selector = protos.Selector
 Bound = protos.Bound
 Point = protos.Point
 
@@ -211,9 +233,49 @@ def load_proto(name):
     return grpc.protos_and_services(name)
 
 
+def to_dict(prot):
+    """ 将 proto 返回值转换为字典 """
+    r = MessageToJson(prot, preserving_proto_field_name=True)
+    return json.loads(r)
+
+
+def Selector(**kwargs):
+    """ Selector wrapper """
+    sel = _Selector(**kwargs, fields=kwargs.keys())
+    return sel
+
+
+class BaseCryptor(object):
+    def __str__(self):
+        return "{}".format(self.__class__.__name__)
+    __repr__ = __str__
+    def encrypt(self, data):
+        return data
+    def decrypt(self, data):
+        return data
+
+
 class BaseServiceStub(object):
+    def __str__(self):
+        return "{}".format(self.__class__.__name__)
+    __repr__ = __str__
     def __init__(self, stub):
         self.stub = stub
+
+
+class FernetCryptor(BaseCryptor):
+    def __init__(self, key=None):
+        key = self._get_key(key)
+        self.encoder = Fernet(key)
+    def encrypt(self, data):
+        return self.encoder.encrypt(data)
+    def decrypt(self, data):
+        return self.encoder.decrypt(data)
+    def _get_key(self, key):
+        key = (key or "").encode()
+        key = hashlib.sha256(key).digest()
+        key = base64.b64encode(key)
+        return key
 
 
 class ClientLoggingInterceptor(ClientInterceptor):
@@ -233,18 +295,14 @@ class ClientLoggingInterceptor(ClientInterceptor):
 
 
 class ClientSessionMetadataInterceptor(ClientInterceptor):
-    def get_instance_ID(self):
-        return "{:06d}{:010d}".format(os.getpid(), id(self))
-
+    def __init__(self, session):
+        super(ClientSessionMetadataInterceptor, self).__init__()
+        self.session = session
     def intercept(self, function, request, details):
-        """
-        在每次远程调用加上本实例的ID用于实现锁功能
-        """
         metadata = {}
         metadata["version"] = __version__
-        metadata["instance"] = self.get_instance_ID()
-        metadata["hostname"] = platform.node()
-        metadata["python_branch"] = platform.python_branch()
+        metadata["instance"] = self.session
+        metadata["hostname"] = quote(platform.node())
         details = details._replace(metadata=metadata.items())
         res = function(request, details)
         return res
@@ -268,25 +326,42 @@ class GrpcRemoteExceptionInterceptor(ClientInterceptor):
         return clazz(*args)
 
     def raise_remote_exception(self, res):
-        metadata = dict(res.initial_metadata())
+        metadata = dict(res.initial_metadata() or [])
         exception = metadata.get("exception", None)
         if exception != None:
             raise self.remote_exception(exception)
 
 
-class ObjectUiAutomatorOpStubWrapper:
+class ObjectUiAutomatorOpStub:
     def __init__(self, stub, selector):
         """
         UiAutomator 子接口，用来模拟出实例的意味
         """
         self._selector = selector
-        self.selector = protos.Selector(**selector)
+        self.selector = Selector(**selector)
         self.stub = stub
     def __str__(self):
         selector = ", ".join(["{}={}".format(k, v) \
                         for k, v in self._selector.items()])
         return "Object: {}".format(selector)
     __repr__ = __str__
+    def _child_sibling(self, name, **selector):
+        s = copy.deepcopy(self._selector)
+        s.setdefault("childOrSibling", [])
+        s.setdefault("childOrSiblingSelector", [])
+        s["childOrSiblingSelector"].append(selector)
+        s["childOrSibling"].append(name)
+        return self.__class__(self.stub, s)
+    def child(self, **selector):
+        """
+        匹配选择器里面的子节点
+        """
+        return self._child_sibling("child", **selector)
+    def sibling(self, **selector):
+        """
+        匹配选择器的同级节点
+        """
+        return self._child_sibling("sibling", **selector)
     def take_screenshot(self, quality=100):
         """
         对选择器选中元素进行截图
@@ -295,6 +370,8 @@ class ObjectUiAutomatorOpStubWrapper:
                                                    quality=quality)
         r = self.stub.selectorTakeScreenshot(req)
         return BytesIO(r.value)
+    def screenshot(self, quality=100):
+        return self.take_screenshot(quality=quality)
     def get_text(self):
         """
         获取选择器选中输入控件中的文本
@@ -334,8 +411,6 @@ class ObjectUiAutomatorOpStubWrapper:
         r = self.stub.selectorClickExists(req)
         return r.value
     def click_exist(self, *args, **kwargs):
-        # deprecated
-        warnings.warn("use d(..).click_exists() instead", DeprecationWarning)
         return self.click_exists(*args, **kwargs)
     def long_click(self, corner=Corner.COR_CENTER):
         """
@@ -353,8 +428,6 @@ class ObjectUiAutomatorOpStubWrapper:
         r = self.stub.selectorExists(req)
         return r.value
     def exist(self, *args, **kwargs):
-        # deprecated
-        warnings.warn("use d(..).exists() instead", DeprecationWarning)
         return self.exists(*args, **kwargs)
     def info(self):
         """
@@ -409,6 +482,22 @@ class ObjectUiAutomatorOpStubWrapper:
                                           direction=direction,
                                           step=step)
         r = self.stub.selectorSwipe(req)
+        return r.value
+    def pinch_in(self, percent, step=16):
+        """
+        双指捏紧（缩小）
+        """
+        req = protos.SelectorPinchRequest(selector=self.selector,
+                                         percent=percent, step=step)
+        r = self.stub.selectorPinchIn(req)
+        return r.value
+    def pinch_out(self, percent, step=16):
+        """
+        双指放开（放大）
+        """
+        req = protos.SelectorPinchRequest(selector=self.selector,
+                                         percent=percent, step=step)
+        r = self.stub.selectorPinchOut(req)
         return r.value
     def _fling_forward(self, is_vertical=True):
         req = protos.SelectorFlingRequest(selector=self.selector,
@@ -540,9 +629,9 @@ class ObjectUiAutomatorOpStubWrapper:
         return self._scroll_to_end(max_swipes, step, is_vertical=False)
 
 
-class UiAutomatorStubWrapper(BaseServiceStub):
+class UiAutomatorStub(BaseServiceStub):
     def __init__(self, *args, **kwargs):
-        super(UiAutomatorStubWrapper, self).__init__(*args, **kwargs)
+        super(UiAutomatorStub, self).__init__(*args, **kwargs)
         self.watchers = defaultdict(dict)
     def device_info(self):
         """
@@ -641,6 +730,12 @@ class UiAutomatorStubWrapper(BaseServiceStub):
         获取此 watcher 是否启用
         """
         return self.watchers.get(name, {}).get("enable")
+    def get_last_toast(self):
+        """
+        获取系统中最后一个 toast 消息
+        """
+        r = self.stub.getLastToast(protos.Empty())
+        return r
     def remove_watcher(self, name):
         """
         移除一个 watcher
@@ -744,12 +839,12 @@ class UiAutomatorStubWrapper(BaseServiceStub):
         req = protos.PressKeyRequest(key=key)
         r = self.stub.pressKey(req)
         return r.value
-    def press_keycode(self, code):
+    def press_keycode(self, code, meta=0):
         """
         通过 Keycode(整数)按下未定义的按键
         ref: https://developer.android.com/reference/android/view/KeyEvent
         """
-        req = protos.PressKeyRequest(code=code)
+        req = protos.PressKeyRequest(code=code, meta=meta)
         r = self.stub.pressKeyCode(req)
         return r.value
     def take_screenshot(self, quality, bound=None):
@@ -760,6 +855,8 @@ class UiAutomatorStubWrapper(BaseServiceStub):
                                            bound=bound)
         r = self.stub.takeScreenshot(req)
         return BytesIO(r.value)
+    def screenshot(self, quality, bound=None):
+        return self.take_screenshot(quality, bound=bound)
     def dump_window_hierarchy(self):
         """
         获取屏幕界面布局 XML 文档
@@ -773,10 +870,10 @@ class UiAutomatorStubWrapper(BaseServiceStub):
         r = self.stub.waitForIdle(protos.Integer(value=timeout))
         return r.value
     def __call__(self, **kwargs):
-        return ObjectUiAutomatorOpStubWrapper(self.stub, kwargs)
+        return ObjectUiAutomatorOpStub(self.stub, kwargs)
 
 
-class ObjectApplicationOpStubWrapper:
+class ApplicationOpStub:
     def __init__(self, stub, applicationId):
         """
         Application 子接口，用来模拟出实例的意味
@@ -784,7 +881,8 @@ class ObjectApplicationOpStubWrapper:
         self.applicationId = applicationId
         self.stub = stub
     def __str__(self):
-        return "Application: {}".format(self.applicationId)
+        return "{}:{}".format(self.stub.__class__.__name__,
+                                        self.applicationId)
     __repr__ = __str__
     def is_foreground(self):
         """
@@ -823,7 +921,7 @@ class ObjectApplicationOpStubWrapper:
         """
         req = protos.ApplicationRequest(name=self.applicationId)
         r = self.stub.queryLaunchActivity(req)
-        return r
+        return to_dict(r)
     def is_permission_granted(self, permission):
         """
         检查是否已经授予应用某权限（应用需要运行时获取的权限）
@@ -846,6 +944,8 @@ class ObjectApplicationOpStubWrapper:
         req = protos.ApplicationRequest(name=self.applicationId)
         r = self.stub.resetApplicationData(req)
         return r.value
+    def reset(self):
+        return self.reset_data()
     def start(self):
         """
         启动应用
@@ -902,13 +1002,6 @@ class ObjectApplicationOpStubWrapper:
         req = protos.ApplicationRequest(name=self.applicationId)
         r = self.stub.removeFromDozeModeWhiteList(req)
         return True
-    def install_from_local_file(self, fpath):
-        """
-        安装设备上的 apk 文件（注意此路径为设备上的 apk 路径）
-        """
-        req = protos.ApplicationRequest(path=fpath)
-        r = self.stub.installFromLocalFile(req)
-        return r
     def is_installed(self):
         """
         检查应用是否已经安装
@@ -918,7 +1011,7 @@ class ObjectApplicationOpStubWrapper:
         return r.value
 
 
-class ApplicationStubWrapper(BaseServiceStub):
+class ApplicationStub(BaseServiceStub):
     def current_application(self):
         """
         获取当前处于前台的应用的信息
@@ -939,9 +1032,16 @@ class ApplicationStubWrapper(BaseServiceStub):
         """
         r = self.stub.enumerateAllPkgNames(protos.Empty())
         return r.names
+    def get_last_activities(self, count=3):
+        """
+        获取系统中最后一个活动的详细信息
+        """
+        req = protos.Integer(value=count)
+        r = self.stub.getLastActivities(req).activities
+        return list(map(to_dict, r))
     def start_activity(self, **activity):
         """
-        启动 activity（任意, always return true）
+        启动 activity（总是返回 True）
         """
         activity.setdefault("extras", {})
         extras = activity.pop("extras")
@@ -949,11 +1049,129 @@ class ApplicationStubWrapper(BaseServiceStub):
         req.extras.update(extras)
         r = self.stub.startActivity(req)
         return r.value
+    def install_app_file(self, fpath):
+        """
+        安装设备上的 apk 文件（注意此路径为设备上的 apk 路径）
+        """
+        req = protos.ApplicationRequest(path=fpath)
+        r = self.stub.installFromLocalFile(req)
+        return r
     def __call__(self, applicationId):
-        return ObjectApplicationOpStubWrapper(self.stub, applicationId)
+        return ApplicationOpStub(self.stub, applicationId)
 
 
-class UtilStubWrapper(BaseServiceStub):
+class StorageOpStub:
+    def __str__(self):
+        return "{}:{}".format(self.stub.__class__.__name__,
+                                            self.name)
+    __repr__ = __str__
+    # 用于容器值序列化的方法
+    def _decrypt(self, data):
+        return self.cryptor.decrypt(data)
+    def _encrypt(self, data):
+        return self.cryptor.encrypt(data)
+    def _unpack(self, value):
+        return msgpack.loads(self._decrypt(value))
+    def _pack(self, value):
+        return self._encrypt(msgpack.dumps(value))
+    # 注意：此接口可能并不是跨语言通用
+    def __init__(self, stub, name, cryptor=None):
+        self.cryptor = cryptor
+        self.name = name
+        self.stub = stub
+    def delete(self, key):
+        """
+        删除一个 KEY
+        """
+        req = protos.StorageRequest(key=key)
+        req.container = self.name
+        res = self.stub.delete(req)
+        return res.value
+    def exists(self, key):
+        """
+        检查一个 KEY 是否存在
+        """
+        req = protos.StorageRequest(key=key)
+        req.container = self.name
+        res = self.stub.exists(req)
+        return res.value
+    def get(self, key, default=None):
+        """
+        获取 KEY 对应的键值
+        """
+        req = protos.StorageRequest(key=key)
+        req.container = self.name
+        val = self.stub.get(req).value
+        res = self._unpack(val) if val else default
+        return res
+    def set(self, key, value):
+        """
+        设置 KEY 对应的键值
+        """
+        value = self._pack(value)
+        req = protos.StorageRequest(key=key, value=value)
+        req.container = self.name
+        res = self.stub.set(req)
+        return res.value
+    def setex(self, key, value, ttl):
+        """
+        设置 KEY 对应的键值，该 KEY 在 TTL 秒后自动删除
+        """
+        value = self._pack(value)
+        req = protos.StorageRequest(key=key, value=value)
+        req.container = self.name
+        req.ttl = ttl
+        res = self.stub.setex(req)
+        return res.value
+    def setnx(self, key, value):
+        """
+        设置 KEY 对应的键值 (仅当该键不存在时)
+        """
+        value = self._pack(value)
+        req = protos.StorageRequest(key=key, value=value)
+        req.container = self.name
+        res = self.stub.setnx(req)
+        return res.value
+    def expire(self, key, ttl):
+        """
+        设置 KEY 在 TTL 秒后过期
+        """
+        req = protos.StorageRequest(key=key, ttl=ttl)
+        req.container = self.name
+        res = self.stub.expire(req)
+        return res.value
+    def ttl(self, key):
+        """
+        获取 KEY 的 TTL (过期时间)
+        """
+        req = protos.StorageRequest(key=key)
+        req.container = self.name
+        res = self.stub.ttl(req)
+        return res.value
+
+
+class StorageStub(BaseServiceStub):
+    def clear(self):
+        """
+        删除所有 Storage 容器
+        """
+        r = self.stub.clearAll(protos.Empty())
+        return r.value
+    def use(self, name, cryptor=BaseCryptor, **kwargs):
+        """
+        使用一个 Storage 容器
+        """
+        return StorageOpStub(self.stub, name, cryptor(**kwargs))
+    def remove(self, name):
+        """
+        删除一个 Storage 容器
+        """
+        req = protos.String(value=name)
+        r = self.stub.clearContainer(req)
+        return r.value
+
+
+class UtilStub(BaseServiceStub):
     def _get_file_content(self, certfile):
         with open(certfile, "rb") as fd:
             return fd.read()
@@ -1007,11 +1225,12 @@ class UtilStubWrapper(BaseServiceStub):
         """
         r = self.stub.shutdown(protos.Empty())
         return r.value
-    def reload(self):
+    def reload(self, clean=False):
         """
         重载设备上运行的服务端
         """
-        r = self.stub.reload(protos.Empty())
+        req = protos.Boolean(value=clean)
+        r = self.stub.reload(req)
         return r.value
     def exit(self):
         """
@@ -1041,7 +1260,26 @@ class UtilStubWrapper(BaseServiceStub):
         return r.value
 
 
-class DebugStubWrapper(BaseServiceStub):
+class DebugStub(BaseServiceStub):
+    def _read_pubkey(self, pubkey):
+        with open(pubkey, "rb") as fd:
+            return fd.read()
+    def install_adb_pubkey(self, pubkey):
+        """
+        给内置 adb 服务添加公钥
+        """
+        req = protos.ADBDConfigRequest()
+        req.adb_pubkey = self._read_pubkey(pubkey)
+        r = self.stub.installADBPubKey(req)
+        return r.value
+    def uninstall_adb_pubkey(self, pubkey):
+        """
+        从内置 adb 服务移除公钥
+        """
+        req = protos.ADBDConfigRequest()
+        req.adb_pubkey = self._read_pubkey(pubkey)
+        r = self.stub.uninstallADBPubKey(req)
+        return r.value
     def is_android_debug_bridge_running(self):
         """
         远端 adb daemon 是否在运行
@@ -1060,20 +1298,11 @@ class DebugStubWrapper(BaseServiceStub):
         """
         r = self.stub.isIDA64Running(protos.Empty())
         return r.value
-    def _get_local_adb_pubkey(self):
-        """
-        读取本地 adb 公钥的内容
-        """
-        fpath = joinpath("~", ".android", "adbkey.pub")
-        with open(expanduser(fpath), "rt") as fd:
-            return fd.read()
     def start_android_debug_bridge(self):
         """
-        启动 adbd (同时将本地 adb 公钥上传以避免认证)
+        启动内置 adbd (默认随框架启动)
         """
-        req = protos.ADBDConfigRequest()
-        req.adb_pubkey = self._get_local_adb_pubkey()
-        r = self.stub.startAndroidDebugBridge(req)
+        r = self.stub.startAndroidDebugBridge(protos.Empty())
         return r.value
     def start_ida(self, port=23932, **env):
         """
@@ -1093,7 +1322,7 @@ class DebugStubWrapper(BaseServiceStub):
         return r.value
     def stop_android_debug_bridge(self):
         """
-        停止 adb daemon (有可能无效)
+        停止内置 adb daemon
         """
         r = self.stub.stopAndroidDebugBridge(protos.Empty())
         return r.value
@@ -1117,7 +1346,7 @@ class DebugStubWrapper(BaseServiceStub):
         return r.value
 
 
-class SettingsStubWrapper(BaseServiceStub):
+class SettingsStub(BaseServiceStub):
     def _put(self, group, name, value):
         req = protos.SettingsRequest(group=group, name=name,
                                             value=value)
@@ -1159,7 +1388,7 @@ class SettingsStubWrapper(BaseServiceStub):
         return self._put(Group.GROUP_SECURE, name, value)
 
 
-class ShellStubWrapper(BaseServiceStub):
+class ShellStub(BaseServiceStub):
     def execute_script(self, script, alias=None):
         """
         前台执行一段脚本（支持标准的多行脚本）
@@ -1190,7 +1419,7 @@ class ShellStubWrapper(BaseServiceStub):
         return r.value
 
 
-class StatusStubWrapper(BaseServiceStub):
+class StatusStub(BaseServiceStub):
     def get_boot_time(self):
         """
         获取设备启动时间 Unix 时间戳
@@ -1249,7 +1478,7 @@ class StatusStubWrapper(BaseServiceStub):
         return r
 
 
-class ProxyStubWrapper(BaseServiceStub):
+class ProxyStub(BaseServiceStub):
     def is_openvpn_running(self):
         """
         检查 OPENVPN 是否正在运行
@@ -1290,7 +1519,7 @@ class ProxyStubWrapper(BaseServiceStub):
         return r.value
 
 
-class SelinuxPolicyStubWrapper(BaseServiceStub):
+class SelinuxPolicyStub(BaseServiceStub):
     def policy_set_allow(self, source, target, tclass, action):
         """
         selinux allow
@@ -1349,47 +1578,48 @@ class SelinuxPolicyStubWrapper(BaseServiceStub):
         return r.value
 
 
-class FileStubWrapper(BaseServiceStub):
-    def _file_stream_read(self, fpath, chunksize):
-        with open(fpath, "rb") as fd:
-            for chunk in iter(lambda: fd.read(chunksize), bytes()):
-                yield chunk
-    def _file_streaming_send(self, fpath, dest, chunksize):
+class FileStub(BaseServiceStub):
+    def _fd_stream_read(self, fd, chunksize):
+        for chunk in iter(lambda: fd.read(chunksize), bytes()):
+            yield chunk
+    def _fd_streaming_send(self, fd, dest, chunksize):
         yield protos.FileRequest(path=dest)
-        for chunk in self._file_stream_read(fpath, chunksize):
+        for chunk in self._fd_stream_read(fd, chunksize):
             yield protos.FileRequest(payload=chunk)
-    def _file_streaming_recv(self, fpath, iterator):
-        with open(fpath, "wb") as fd:
-            for chunk in iterator:
-                fd.write(chunk.payload)
-    def download_file(self, fpath, dest):
+    def _fd_streaming_recv(self, fd, iterator):
+        for chunk in iterator:
+            fd.write(chunk.payload)
+    def download_fd(self, fpath, fd):
         """
-        下载设备上的文件到本地, dest: 下载到本地的路径
+        从设备下载文件到文件描述符
         """
-        if os.path.isdir(dest):
-            dest = joinpath(dest, basename(fpath))
-        st = self.file_stat(fpath)
         req = protos.FileRequest(path=fpath)
         iterator = self.stub.downloadFile(req)
-        self._file_streaming_recv(dest, iterator)
-        mode = st.st_mode & 0o777
-        os.chmod(dest, mode)
+        self._fd_streaming_recv(fd, iterator)
+        st = self.file_stat(fpath)
         return st
-    def upload_file(self, fpath, dest):
+    def upload_fd(self, fd, dest):
         """
-        上传本地文件到设备中, dest: 上传在设备的路径
+        上传文件描述符至设备
         """
-        chunksize = 1024*1024
-        if not os.path.isfile(fpath):
-            raise OSError("%s is not a file" % fpath)
-        if not os.access(fpath, os.R_OK):
-            raise OSError("%s is not readable" % fpath)
-        streaming = self._file_streaming_send(fpath, dest,
+        chunksize = 1024*1024*1
+        streaming = self._fd_streaming_send(fd, dest,
                                               chunksize)
         self.stub.uploadFile(streaming)
-        mode = os.stat(fpath).st_mode & 0o777
-        st = self.file_chmod(dest, mode)
+        st = self.file_stat(dest)
         return st
+    def download_file(self, fpath, dest):
+        """
+        从设备下载文件到本地
+        """
+        with io.open(dest, mode="wb") as fd:
+            return self.download_fd(fpath, fd)
+    def upload_file(self, fpath, dest):
+        """
+        上传本地文件至设备
+        """
+        with io.open(fpath, mode="rb") as fd:
+            return self.upload_fd(fd, dest)
     def delete_file(self, fpath):
         """
         删除设备上的文件
@@ -1413,13 +1643,25 @@ class FileStubWrapper(BaseServiceStub):
         return r
 
 
-class LockStubWrapper(BaseServiceStub):
+class LockStub(BaseServiceStub):
     def acquire_lock(self, leaseTime=60):
         """
         获取用于控制设备的锁，成功返回 true，被占用则会引发异常提示
         """
         req = protos.Integer(value=leaseTime)
         r = self.stub.acquireLock(req)
+        return r.value
+    def get_locking_session(self):
+        """
+        获取当前占有设备锁的会话ID
+        """
+        r = self.stub.getLockingSession(protos.Empty())
+        return r.value
+    def get_session_token(self):
+        """
+        获取当前占有设备锁的会话的令牌
+        """
+        r = self.stub.getSessionToken(protos.Empty())
         return r.value
     def refresh_lock(self, leaseTime=60):
         """
@@ -1436,7 +1678,7 @@ class LockStubWrapper(BaseServiceStub):
         return r.value
 
 
-class WifiStubWrapper(BaseServiceStub):
+class WifiStub(BaseServiceStub):
     def status(self):
         """
         获取当前已连接 WIFI 的信息
@@ -1527,57 +1769,70 @@ class WifiStubWrapper(BaseServiceStub):
 
 class Device(object):
     def __init__(self, host, port=65000,
-                                        certificate=None):
+                                        certificate=None,
+                                        session=None):
         self.certificate = certificate
         self.server = "{0}:{1}".format(host, port)
         if certificate is not None:
             with open(certificate, "rb") as fd:
-                cer = fd.read()
-            creds = grpc.ssl_channel_credentials(cer)
-            chann = grpc.secure_channel(self.server, creds,
+                key, crt, ca = self._parse_certdata(fd.read())
+            creds = grpc.ssl_channel_credentials(root_certificates=ca,
+                                                 certificate_chain=crt,
+                                                 private_key=key)
+            self._chan = grpc.secure_channel(self.server, creds,
                     options=(("grpc.ssl_target_name_override",
-                              self._ssl_common_name(cer)),
-                    ))
+                                self._parse_cname(crt)),
+                             ("grpc.enable_http_proxy",
+                                0)))
         else:
-            chann = grpc.insecure_channel(self.server)
-        interceptors = [ClientSessionMetadataInterceptor(),
+            self._chan = grpc.insecure_channel(self.server)
+        session = session or uuid.uuid4().hex
+        interceptors = [ClientSessionMetadataInterceptor(session),
                         GrpcRemoteExceptionInterceptor(),
                         ClientLoggingInterceptor()]
-        self.chann = grpc.intercept_channel(chann,
+        self.channel = grpc.intercept_channel(self._chan,
                         *interceptors)
+        self.session = session
     @property
     def frida(self):
         if _frida_dma is None:
             raise ModuleNotFoundError("frida")
+        kwargs = {}
         if self.certificate is not None:
-            device = _frida_dma.add_remote_device(self.server,
-                            certificate=self.certificate)
-        else:
-            device = _frida_dma.add_remote_device(self.server)
+            kwargs["certificate"] = self.certificate
+        if self._get_session_token():
+            kwargs["token"] = self._get_session_token()
+        device = _frida_dma.add_remote_device(self.server,
+                                        **kwargs)
         return device
     def __str__(self):
         return "Device@{}".format(self.server)
     __repr__ = __str__
-    def _get_proto_stub(self, module):
-        stub = getattr(services, "{0}Stub".format(module))
-        return stub
-    def _ssl_common_name(self, cer):
-        _, _, der = pem.unarmor(cer)
+    def _parse_certdata(self, data):
+        key, crt, ca = Pem.parse(data)
+        ca = ca.as_bytes()
+        crt = crt.as_bytes()
+        key = key.as_bytes()
+        return key, crt, ca
+    def _parse_cname(self, crt):
+        _, _, der = pem.unarmor(crt)
         subject = x509.Certificate.load(der).subject
         return subject.native["common_name"]
-    def _initialize_service_stub(self, module):
-        stub = self._get_proto_stub(module)
-        stub = getattr(self, module, stub(self.chann))
-        setattr(self, module, stub)
+    def _get_service_stub(self, module):
+        stub = getattr(services, "{0}Stub".format(module))
+        return stub(self.channel)
     def stub(self, module):
-        self._initialize_service_stub(module)
-        wrapper = globals()["{}StubWrapper".format(module)]
-        name = "{}_classInstance".format(module)
-        wraped = getattr(self, name, wrapper(getattr(self, module)))
-        # DoN't aSk ME why i dO this SHiT
-        setattr(self, name, wraped)
-        return wraped
+        modu = sys.modules[__name__]
+        stub = self._get_service_stub(module)
+        wrap = getattr(modu, "{0}Stub".format(module))
+        inst = getattr(self, module, wrap(stub))
+        self.__setattr__(module, inst)
+        return inst
     # 快速调用: File
+    def download_fd(self, fpath, fd):
+        return self.stub("File").download_fd(fpath, fd)
+    def upload_fd(self, fd, dest):
+        return self.stub("File").upload_fd(fd, dest)
     def download_file(self, fpath, dest):
         return self.stub("File").download_file(fpath, dest)
     def upload_file(self, fpath, dest):
@@ -1589,12 +1844,16 @@ class Device(object):
     def file_stat(self, fpath):
         return self.stub("File").file_stat(fpath)
     # 快速调用: Application
+    def install_app_file(self, rpath):
+        return self.stub("Application").install_app_file(rpath)
     def current_application(self):
         return self.stub("Application").current_application()
     def enumerate_all_pkg_names(self):
         return self.stub("Application").enumerate_all_pkg_names()
     def enumerate_running_processes(self):
         return self.stub("Application").enumerate_running_processes()
+    def get_last_activities(self, count=3):
+        return self.stub("Application").get_last_activities(count=count)
     def start_activity(self, **activity):
         return self.stub("Application").start_activity(**activity)
     def application(self, applicationId):
@@ -1616,8 +1875,8 @@ class Device(object):
         return self.stub("Util").shutdown()
     def exit(self):
         return self.stub("Util").exit()
-    def reload(self):
-        return self.stub("Util").reload()
+    def reload(self, clean=False):
+        return self.stub("Util").reload(clean)
     def beep(self):
         return self.stub("Util").beep()
     def setprop(self, name, value):
@@ -1625,6 +1884,10 @@ class Device(object):
     def getprop(self, name):
         return self.stub("Util").getprop(name)
     # 快速调用: Debug
+    def install_adb_pubkey(self, pubkey):
+        return self.stub("Debug").install_adb_pubkey(pubkey)
+    def uninstall_adb_pubkey(self, pubkey):
+        return self.stub("Debug").uninstall_adb_pubkey(pubkey)
     def start_android_debug_bridge(self):
         return self.stub("Debug").start_android_debug_bridge()
     def is_android_debug_bridge_running(self):
@@ -1644,6 +1907,15 @@ class Device(object):
         return self.stub("Proxy").stop_openvpn()
     def stop_gproxy(self):
         return self.stub("Proxy").stop_gproxy()
+    # 快速调用: Shell
+    def execute_script(self, script, alias=None):
+        return self.stub("Shell").execute_script(script, alias=alias)
+    def execute_background_script(self, script, alias=None):
+        return self.stub("Shell").execute_background_script(script, alias=alias)
+    def is_background_script_finished(self, tid):
+        return self.stub("Shell").is_background_script_finished(tid)
+    def kill_background_script(self, tid):
+        return self.stub("Shell").kill_background_script(tid)
     # 快速调用: UiAutomator
     def click(self, point):
         return self.stub("UiAutomator").click(point)
@@ -1675,14 +1947,18 @@ class Device(object):
         return self.stub("UiAutomator").set_orientation(orien)
     def press_key(self, key):
         return self.stub("UiAutomator").press_key(key)
-    def press_keycode(self, code):
-        return self.stub("UiAutomator").press_keycode(code)
+    def press_keycode(self, code, meta=0):
+        return self.stub("UiAutomator").press_keycode(code, meta)
     def take_screenshot(self, quality=100, bound=None):
         return self.stub("UiAutomator").take_screenshot(quality, bound=bound)
+    def screenshot(self, quality=100, bound=None):
+        return self.stub("UiAutomator").screenshot(quality, bound=bound)
     def dump_window_hierarchy(self):
         return self.stub("UiAutomator").dump_window_hierarchy()
     def wait_for_idle(self, timeout):
         return self.stub("UiAutomator").wait_for_idle(timeout)
+    def get_last_toast(self):
+        return self.stub("UiAutomator").get_last_toast()
     # watcher
     def remove_all_watchers(self):
         return self.stub("UiAutomator").remove_all_watchers()
@@ -1719,16 +1995,29 @@ class Device(object):
         return self.stub("UiAutomator").device_info()
     def __call__(self, **kwargs):
         return self.stub("UiAutomator")(**kwargs)
+    # 日志打印
+    def setup_log_format(self):
+        logging.basicConfig(format=FORMAT)
     def set_debug_log_enabled(self, enable):
-        logger.setLevel(logging.DEBUG if enable else logging.WARNING)
+        level = logging.DEBUG if enable else logging.WARN
+        logger.setLevel(level)
         return enable
     # 接口锁定
+    def _get_session_token(self):
+        return self.stub("Lock").get_session_token()
+    def _get_locking_session(self):
+        return self.stub("Lock").get_locking_session()
     def _acquire_lock(self, leaseTime=60):
         return self.stub("Lock").acquire_lock(leaseTime)
     def _refresh_lock(self, leaseTime=60):
         return self.stub("Lock").refresh_lock(leaseTime)
     def _release_lock(self):
         return self.stub("Lock").release_lock()
+    def __enter__(self):
+        self._acquire_lock(leaseTime=sys.maxsize)
+        return self
+    def __exit__(self, type, value, traceback):
+        self._release_lock()
 
 
 if __name__ == "__main__":
@@ -1738,19 +2027,16 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-device", type=str, required=True,
+    crt = os.environ.get("CERTIFICATE", None)
+    port = int(os.environ.get("PORT", 65000))
+    parser.add_argument("-device", type=str, default="localhost",
                                    help="service ip address")
-    parser.add_argument("-port", type=int, default=65000,
+    parser.add_argument("-port", type=int, default=port,
                                    help="service port")
-    parser.add_argument("-cert", type=str, default=None,
+    parser.add_argument("-cert", type=str, default=crt,
                                    help="ssl cert")
     args = parser.parse_args()
 
-    HIST = expanduser("~/.lamda-cli_history")
-    pathlib.Path(HIST).touch(exist_ok=True)
-
-    readline.read_history_file(HIST)
-    atexit.register(readline.write_history_file, HIST)
     readline.parse_and_bind("tab: complete")
 
     d = Device(args.device, port=args.port,
