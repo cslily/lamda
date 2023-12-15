@@ -1,4 +1,4 @@
-// Copyright 2022 rev1si0n (ihaven0emmail@gmail.com). All rights reserved.
+// Copyright 2022 rev1si0n (lamda.devel@gmail.com). All rights reserved.
 //
 // Distributed under MIT license.
 // See file LICENSE for detail or copy at https://opensource.org/licenses/MIT
@@ -448,14 +448,6 @@ message SelectorDragToRequest {
         }
         uint32 step               = 5;
 }
-message SelectorScrollToRequest {
-        Selector selector         = 1;
-        oneof _target {
-                Selector target   = 3;
-                Point point       = 4;
-        }
-        bool vertical             = 5;
-}
 message SelectorWaitRequest {
         Selector selector         = 1;
         uint32 timeout            = 3;
@@ -472,6 +464,7 @@ message SelectorFlingRequest {
 }
 message SelectorScrollRequest {
         Selector selector         = 1;
+        Selector target           = 2;
         bool vertical             = 3;
         uint32 maxSwipes          = 4;
         uint32 step               = 5;

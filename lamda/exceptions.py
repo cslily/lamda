@@ -1,4 +1,4 @@
-# Copyright 2022 rev1si0n (ihaven0emmail@gmail.com). All rights reserved.
+# Copyright 2022 rev1si0n (https://github.com/rev1si0n). All rights reserved.
 #
 # Distributed under MIT license.
 # See file LICENSE for detail or copy at https://opensource.org/licenses/MIT
@@ -7,6 +7,8 @@ class CompatibilityException(Exception):
 class DeadSystemException(Exception):
     """ Exception """
 class DeviceUnavailable(Exception):
+    """ Exception """
+class DuplicateEntryError(Exception):
     """ Exception """
 class IllegalArgumentException(Exception):
     """ Exception """
@@ -17,6 +19,8 @@ class InstallPackageFailed(Exception):
 class InternalRpcException(Exception):
     """ Exception """
 class InvalidAndroidPackage(Exception):
+    """ Exception """
+class InvalidArgumentError(Exception):
     """ Exception """
 class InvalidRootCertificate(Exception):
     """ Exception """

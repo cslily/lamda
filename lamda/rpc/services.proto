@@ -1,4 +1,4 @@
-// Copyright 2022 rev1si0n (ihaven0emmail@gmail.com). All rights reserved.
+// Copyright 2022 rev1si0n (lamda.devel@gmail.com). All rights reserved.
 //
 // Distributed under MIT license.
 // See file LICENSE for detail or copy at https://opensource.org/licenses/MIT
@@ -135,7 +135,7 @@ service UiAutomator {
     rpc deviceInfo(google.protobuf.Empty) returns (DeviceInfo) {}
 
     rpc takeScreenshot(TakeScreenshotRequest) returns (Bytes) {}
-    rpc dumpWindowHierarchy(google.protobuf.Empty) returns (Bytes) {}
+    rpc dumpWindowHierarchy(Boolean) returns (Bytes) {}
     rpc waitForIdle(Integer) returns (Boolean) {}
 
     rpc selectorTakeScreenshot(SelectorTakeScreenshotRequest) returns (Bytes) {}
@@ -170,6 +170,7 @@ service UiAutomator {
     rpc selectorScrollToEnd(SelectorScrollRequest) returns (Boolean) {}
     rpc selectorScrollBackward(SelectorScrollRequest) returns (Boolean) {}
     rpc selectorScrollForward(SelectorScrollRequest) returns (Boolean) {}
+    rpc selectorScrollTo(SelectorScrollRequest) returns (Boolean) {}
 
     rpc selectorPinchOut(SelectorPinchRequest) returns (Boolean) {}
     rpc selectorPinchIn(SelectorPinchRequest) returns (Boolean) {}
@@ -237,7 +238,6 @@ service File {
 
 service Lock {
     rpc releaseLock(google.protobuf.Empty) returns (Boolean) {}
-    rpc getLockingSession(google.protobuf.Empty) returns (String) {}
     rpc getSessionToken(google.protobuf.Empty) returns (String) {}
     rpc acquireLock(Integer) returns (Boolean) {}
     rpc refreshLock(Integer) returns (Boolean) {}
